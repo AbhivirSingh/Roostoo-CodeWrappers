@@ -2,16 +2,17 @@ import time
 import hmac
 import hashlib
 import requests
-import json
 import logging
 import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-import uuid
+import random
 import yfinance as yf
 import talib
 import config
+import os
+import csv, json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -21,18 +22,23 @@ logging.basicConfig(level=logging.INFO,
 API_BASE_URL = "https://mock-api.roostoo.com"
 API_KEY = config.API_KEY
 SECRET_KEY = config.SECRET_KEY
-RISK_FREE_RATE = 0.001  # 0.1% risk-free rate
-FETCH_INTERVAL = 10  # seconds between market data fetches
-TRADING_INTERVAL = 20  # seconds between trading decisions
-POSITION_SIZE_PCT = 0.05  # Risk 5% of portfolio per coin
-BUYING_COMMISSION = 0.001  # 0.1% commission on buys
-SELLING_COMMISSION = 0.001  # 0.1% commission on sells
-STOP_LOSS_PCT = 0.03  # 3% stop loss
-TAKE_PROFIT_PCT = 0.06  # 6% take profit
-MAX_COINS = 5  # Maximum number of coins to trade simultaneously
-MIN_SCORE_THRESHOLD = 0.1  # Minimum score to consider a coin for trading
-YF_HISTORICAL_PERIOD = "1y"  # Fetch 1 year of historical data
-YF_INTERVAL = "1d"  # Daily data
+RISK_FREE_RATE = 0.001
+FETCH_INTERVAL = 10
+TRADING_INTERVAL = 20
+POSITION_SIZE_PCT = 0.05
+MAX_PORTFOLIO_RISK = 0.5
+BUYING_COMMISSION = 0.001
+SELLING_COMMISSION = 0.001
+STOP_LOSS_PCT = 0.03
+TAKE_PROFIT_PCT = 0.06
+MIN_SCORE_THRESHOLD = 0.1
+MIN_PROFIT_SCORE = 10.0
+YF_HISTORICAL_PERIOD = "max"
+YF_INTERVAL = "1h"
+DATA_DIR = "data"  # Directory for price and trade history files
+MAX_PRICE_RECORDS = 10000  # Limit for price history records
+MAX_TRADE_RECORDS = 1000  # Limit for trade history records
+
 
 # Technical Indicator Parameters
 RSI_PERIOD = 14
@@ -47,15 +53,73 @@ STOCH_K = 14
 STOCH_D = 3
 STOCH_SLOWD = 3
 
+
+
 # Validate TAKE_PROFIT_PCT and STOP_LOSS_PCT
 MIN_TAKE_PROFIT = (1 + BUYING_COMMISSION) / (1 - SELLING_COMMISSION) - 1
 MIN_STOP_LOSS = 1 - (1 - BUYING_COMMISSION) / (1 + SELLING_COMMISSION)
 if TAKE_PROFIT_PCT <= MIN_TAKE_PROFIT:
-    logging.warning(f"TAKE_PROFIT_PCT ({TAKE_PROFIT_PCT}) is below minimum ({MIN_TAKE_PROFIT}). Adjusting to {MIN_TAKE_PROFIT + 0.001}.")
+    logging.warning(f"TAKE_PROFIT_PCT ({TAKE_PROFIT_PCT}) is below minimum ({MIN_TAKE_PROFIT}). Adjusting.")
     TAKE_PROFIT_PCT = MIN_TAKE_PROFIT + 0.001
 if STOP_LOSS_PCT <= MIN_STOP_LOSS:
-    logging.warning(f"STOP_LOSS_PCT ({STOP_LOSS_PCT}) is below minimum ({MIN_STOP_LOSS}). Adjusting to {MIN_STOP_LOSS + 0.001}.")
+    logging.warning(f"STOP_LOSS_PCT ({STOP_LOSS_PCT}) is below minimum ({MIN_STOP_LOSS}). Adjusting.")
     STOP_LOSS_PCT = MIN_STOP_LOSS + 0.001
+
+
+# --- UTILITY FUNCTIONS ---
+def ensure_data_directory():
+    """Ensure the data directory exists."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception as e:
+        logging.error(f"Failed to create data directory {DATA_DIR}: {e}")
+
+def append_price_history(coin, timestamp, price):
+    """Append price data to a coin's CSV file."""
+    try:
+        ensure_data_directory()
+        filename = os.path.join(DATA_DIR, f"price_history_{coin}.csv")
+        file_exists = os.path.exists(filename)
+        with open(filename, "a", newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["timestamp", "price"])
+            writer.writerow([timestamp.isoformat(), price])
+        
+        # Trim file if it exceeds MAX_PRICE_RECORDS
+        df = pd.read_csv(filename)
+        if len(df) > MAX_PRICE_RECORDS:
+            df = df.tail(MAX_PRICE_RECORDS)
+            df.to_csv(filename, index=False)
+    except Exception as e:
+        logging.error(f"Failed to append price history for {coin}: {e}")
+
+def append_trade_history(coin, trade):
+    """Append trade data to a coin's JSON file."""
+    try:
+        ensure_data_directory()
+        filename = os.path.join(DATA_DIR, f"trade_history_{coin}.json")
+        trades = []
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r") as f:
+                    trades = json.load(f)
+            except json.JSONDecodeError:
+                logging.warning(f"Corrupted JSON in {filename}, starting fresh.")
+        
+        # Ensure trade timestamp is JSON-serializable
+        trade_copy = trade.copy()
+        trade_copy["timestamp"] = trade_copy["timestamp"].isoformat()
+        trades.append(trade_copy)
+        
+        # Trim if exceeds MAX_TRADE_RECORDS
+        if len(trades) > MAX_TRADE_RECORDS:
+            trades = trades[-MAX_TRADE_RECORDS:]
+        
+        with open(filename, "w") as f:
+            json.dump(trades, f, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to append trade history for {coin}: {e}")
 
 # --- API CLIENT ---
 class RoostooAPIClient:
@@ -165,11 +229,79 @@ class CoinSelector:
         self.price_history = {}
         self.trade_history = {}
         self.historical_data = {}
+        self.recent_scores = []
         self.ticker_mapping = {
             "BTC/USD": "BTC-USD",
             "ETH/USD": "ETH-USD",
             "LTC/USD": "LTC-USD",
-            # Add more mappings as needed
+            "IMX/USD": "IMX-USD",
+            "NEO/USD": "NEO-USD",
+            "WLD/USD": "WLD-USD",
+            "AVAX/USD": "AVAX-USD",
+            "ENA/USD": "ENA-USD",
+            "DOT/USD": "DOT-USD",
+            "EGLD/USD": "EGLD-USD",
+            "ETC/USD": "ETC-USD",
+            "ZEC/USD": "ZEC-USD",
+            "DYDX/USD": "DYDX-USD",
+            "ENS/USD": "ENS-USD",
+            "INJ/USD": "INJ-USD",
+            "QTUM/USD": "QTUM-USD",
+            "RUNE/USD": "RUNE-USD",
+            "VET/USD": "VET-USD",
+            "MINA/USD": "MINA-USD",
+            "AXS/USD": "AXS-USD",
+            "PEOPLE/USD": "PEOPLE-USD",
+            "WIF/USD": "WIF-USD",
+            "BNX/USD": "BNX-USD",
+            "NEAR/USD": "NEAR-USD",
+            "TRX/USD": "TRX-USD",
+            "PEPE/USD": "PEPE-USD",
+            "RARE/USD": "RARE-USD",
+            "GALA/USD": "GALA-USD",
+            "BCH/USD": "BCH-USD",
+            "TRUMP/USD": "TRUMP-USD",
+            "FET/USD": "FET-USD",
+            "ALGO/USD": "ALGO-USD",
+            "SUI/USD": "SUI-USD",
+            "SHIB/USD": "SHIB-USD",
+            "ACH/USD": "ACH-USD",
+            "DOGE/USD": "DOGE-USD",
+            "FLOKI/USD": "FLOKI-USD",
+            "EOS/USD": "EOS-USD",
+            "CAKE/USD": "CAKE-USD",
+            "OM/USD": "OM-USD",
+            "RENDER/USD": "RENDER-USD",
+            "ADA/USD": "ADA-USD",
+            "TAO/USD": "TAO-USD",
+            "XRP/USD": "XRP-USD",
+            "PENDLE/USD": "PENDLE-USD",
+            "ZIL/USD": "ZIL-USD",
+            "HBAR/USD": "HBAR-USD",
+            "SOL/USD": "SOL-USD",
+            "BERA/USD": "BERA-USD",
+            "TON/USD": "TON-USD",
+            "AR/USD": "AR-USD",
+            "SUSHI/USD": "SUSHI-USD",
+            "BNB/USD": "BNB-USD",
+            "JASMY/USD": "JASMY-USD",
+            "ATOM/USD": "ATOM-USD",
+            "GRT/USD": "GRT-USD",
+            "CRV/USD": "CRV-USD",
+            "SUPER/USD": "SUPER-USD",
+            "POL/USD": "POL-USD",
+            "ICP/USD": "ICP-USD",
+            "AAVE/USD": "AAVE-USD",
+            "SAND/USD": "SAND-USD",
+            "XLM/USD": "XLM-USD",
+            "FIL/USD": "FIL-USD",
+            "LINK/USD": "LINK-USD",
+            "XTZ/USD": "XTZ-USD",
+            "STRAX/USD": "STRAX-USD",
+            "EIGEN/USD": "EIGEN-USD",
+            "S/USD": "S-USD",
+            "UNI/USD": "UNI-USD",
+            "APT/USD": "APT-USD"
         }
 
     def update_trade_history(self, coin, trade):
@@ -178,6 +310,8 @@ class CoinSelector:
         self.trade_history[coin].append(trade)
         if len(self.trade_history[coin]) > 50:
             self.trade_history[coin].pop(0)
+        # Save to file
+        append_trade_history(coin, trade)
 
     def fetch_historical_data(self, ticker):
         try:
@@ -186,8 +320,16 @@ class CoinSelector:
             asset = yf.Ticker(ticker)
             hist = asset.history(period=YF_HISTORICAL_PERIOD, interval=YF_INTERVAL)
             if hist.empty:
-                logging.warning(f"No historical data for {ticker}")
-                return None
+                hist = asset.history(period="2y", interval=YF_INTERVAL)
+                if hist.empty:
+                    hist = asset.history(period="1y", interval=YF_INTERVAL)
+                    if hist.empty:
+                        hist = asset.history(period="6mo", interval="1h")
+                        if hist.empty:
+                            hist = asset.history(period="1y", interval="1d")
+                            if hist.empty:
+                                logging.warning(f"No historical data for {ticker}")
+                                return None
             self.historical_data[ticker] = hist
             return hist
         except Exception as e:
@@ -199,16 +341,15 @@ class CoinSelector:
             return 0, 0, 0
         closes = hist["Close"]
         returns = closes.pct_change().dropna()
-        annualized_return = ((1 + returns.mean()) ** 252 - 1) * 100  # 252 trading days
+        annualized_return = ((1 + returns.mean()) ** 252 - 1) * 100
         volatility = returns.std() * np.sqrt(252) * 100
         ma50 = closes.rolling(window=50).mean().iloc[-1]
         ma200 = closes.rolling(window=200).mean().iloc[-1]
-        ma_signal = 1 if ma50 > ma200 else 0  # Golden cross signal
+        ma_signal = 1 if ma50 > ma200 else 0
         return annualized_return, volatility, ma_signal
 
     def calculate_coin_score(self, coin, pair):
         score = 0
-        # Short-term metrics
         if pair in self.price_history and len(self.price_history[pair]) >= 10:
             prices = np.array(self.price_history[pair])
             short_term_volatility = np.std(prices) / np.mean(prices)
@@ -224,21 +365,29 @@ class CoinSelector:
         else:
             score += 0.2
 
-        # Long-term metrics
         ticker = self.ticker_mapping.get(pair, None)
         if ticker:
             hist = self.fetch_historical_data(ticker)
             annualized_return, long_term_volatility, ma_signal = self.calculate_historical_metrics(hist)
-            score += annualized_return * 0.5  # Reward high returns
-            score += long_term_volatility * 0.2  # Moderate weight for volatility
-            score += ma_signal * 10  # Boost for bullish trend
+            score += annualized_return * 0.5
+            score += long_term_volatility * 0.2
+            score += ma_signal * 10
         else:
-            # logging.warning(f"No yfinance ticker mapping for {pair}")
             score += 0.1
 
-        return max(score, MIN_SCORE_THRESHOLD)
+        score = max(score, MIN_SCORE_THRESHOLD)
+        self.recent_scores.append(score)
+        if len(self.recent_scores) > 100:
+            self.recent_scores.pop(0)
+        return score
+    
+    def get_dynamic_score_threshold(self):
+        if not self.recent_scores:
+            return MIN_PROFIT_SCORE
+        # Use 75th percentile of recent scores as threshold
+        return np.percentile(self.recent_scores, 75)
 
-    def select_coins(self, max_coins=MAX_COINS):
+    def select_coins(self):
         available_pairs = self.api_client.list_of_coins()
         if not available_pairs:
             return [("BTC", "BTC/USD")]
@@ -247,28 +396,35 @@ class CoinSelector:
             ticker_data = self.api_client.get_ticker(pair=pair)
             if ticker_data and ticker_data.get("Success"):
                 price = float(ticker_data["Data"][pair]["LastPrice"])
+                coin = pair.split("/")[0]
+                timestamp = datetime.now()
                 if pair not in self.price_history:
                     self.price_history[pair] = []
                 self.price_history[pair].append(price)
-                if len(self.price_history[pair]) > 20:
+                if len(self.price_history[pair]) > 40:
                     self.price_history[pair].pop(0)
+                # Save price to file
+                append_price_history(coin, timestamp, price)
 
+        # Calculate scores for all coins
         coin_scores = []
         for pair in available_pairs:
             coin = pair.split("/")[0]
             score = self.calculate_coin_score(coin, pair)
             coin_scores.append((coin, pair, score))
 
-        coin_scores.sort(key=lambda x: x[2], reverse=True)
-        selected = [(c, p) for c, p, s in coin_scores[:max_coins]]
+        # Dynamic score threshold
+        min_profit_score = max(MIN_PROFIT_SCORE, self.get_dynamic_score_threshold())
         
-        if len(selected) < max_coins and len(coin_scores) > len(selected):
-            selected.extend([(c, p) for c, p, s in coin_scores[len(selected):max_coins]])
+        # Select coins above the threshold, sorted by score
+        coin_scores.sort(key=lambda x: x[2], reverse=True)
+        selected = [(c, p) for c, p, s in coin_scores if s >= min_profit_score]
 
-        if not selected:
+        if not selected and coin_scores:
+            # Fallback to the highest-scoring coin if none meet threshold
             selected = [(coin_scores[0][0], coin_scores[0][1])]
 
-        logging.info(f"Selected coins: {[c for c, p in selected]}, Scores: {[s for _, _, s in coin_scores[:len(selected)]]}")
+        logging.info(f"Selected {len(selected)} coins: {[c for c, p in selected]}, Scores: {[s for _, _, s in coin_scores if s >= min_profit_score]}")
         return selected
 
 # --- TRADING STRATEGY ---
@@ -278,6 +434,7 @@ class AutonomousStrategy:
         self.strategies = {}
         self.price_data = {}
         self.strategy_performance = {}
+        self.strategy_trade_count = {}  # Track trade counts
         self.available_strategies = [
             "mean_reversion",
             "macd_crossover",
@@ -295,12 +452,13 @@ class AutonomousStrategy:
                 "buy_price": None,
                 "stop_loss_price": None,
                 "take_profit_price": None,
-                "active_strategy": "mean_reversion"  # Default strategy
+                "active_strategy": random.choice(self.available_strategies)  # Random initial strategy
             }
         if coin not in self.price_data:
             self.price_data[coin] = []
         if coin not in self.strategy_performance:
             self.strategy_performance[coin] = {strat: 0 for strat in self.available_strategies}
+            self.strategy_trade_count[coin] = {strat: 0 for strat in self.available_strategies}
         return self.strategies[coin]
 
     def update_price_data(self, coin, price):
@@ -356,11 +514,17 @@ class AutonomousStrategy:
         logging.info(f"{coin} - Set Stop Loss: {state['stop_loss_price']:.6f}, Take Profit: {state['take_profit_price']:.6f}")
 
     def select_best_strategy(self, coin):
-        # Select strategy with highest performance score
         state = self.get_strategy_state(coin)
-        if state["no"] < self.lookback_period:
-            return state["active_strategy"]
-        best_strategy = max(self.strategy_performance[coin], key=self.strategy_performance[coin].get)
+        # Epsilon-greedy exploration
+        epsilon = 0.1
+        if random.random() < epsilon:
+            best_strategy = random.choice(self.available_strategies)
+        else:
+            normalized_scores = {
+                strat: self.strategy_performance[coin][strat] / (self.strategy_trade_count[coin][strat] or 1)
+                for strat in self.strategy_performance[coin]
+            }
+            best_strategy = max(normalized_scores, key=normalized_scores.get)
         state["active_strategy"] = best_strategy
         logging.info(f"{coin} - Selected strategy: {best_strategy}")
         return best_strategy
@@ -542,27 +706,39 @@ class AutonomousStrategy:
     def update_strategy_performance(self, coin, strategy, signal, profit_pct=0):
         if signal == "SELL" and profit_pct:
             self.strategy_performance[coin][strategy] += profit_pct
+            self.strategy_trade_count[coin][strategy] += 1
         elif signal == "BUY":
-            self.strategy_performance[coin][strategy] += 0.1  # Small reward for entering position
+            self.strategy_performance[coin][strategy] += 0.1
+            self.strategy_trade_count[coin][strategy] += 1
+        # Apply decay
+        decay_factor = 0.99
+        for strat in self.strategy_performance[coin]:
+            self.strategy_performance[coin][strat] *= decay_factor
 
     def generate_signal(self, coin, price):
         state = self.get_strategy_state(coin)
         indicators = self.calculate_indicators(coin)
         active_strategy = self.select_best_strategy(coin)
-
-        if active_strategy == "mean_reversion":
-            signal = self.mean_reversion_strategy(coin, price, indicators)
-        elif active_strategy == "macd_crossover":
-            signal = self.macd_crossover_strategy(coin, price, indicators)
-        elif active_strategy == "rsi_strategy":
-            signal = self.rsi_strategy(coin, price, indicators)
-        elif active_strategy == "bollinger_bands":
-            signal = self.bollinger_bands_strategy(coin, price, indicators)
-        else:  # combined
-            signal = self.combined_strategy(coin, price, indicators)
-
-        # Update performance (profit_pct will be set in simulate_trade)
-        self.update_strategy_performance(coin, active_strategy, signal)
+        
+        # Generate signals for all strategies
+        signals = {
+            "mean_reversion": self.mean_reversion_strategy(coin, price, indicators),
+            "macd_crossover": self.macd_crossover_strategy(coin, price, indicators),
+            "rsi_strategy": self.rsi_strategy(coin, price, indicators),
+            "bollinger_bands": self.bollinger_bands_strategy(coin, price, indicators),
+            "combined": self.combined_strategy(coin, price, indicators)
+        }
+        
+        # Update performance for all strategies
+        for strategy, signal in signals.items():
+            if signal == "SELL" and state["position_status"] == "HOLDING" and state["buy_price"]:
+                profit_pct = ((price / state["buy_price"]) - 1) * 100
+                self.update_strategy_performance(coin, strategy, signal, profit_pct)
+            elif signal == "BUY":
+                self.update_strategy_performance(coin, strategy, signal)
+        
+        # Return signal for active strategy
+        signal = signals[active_strategy]
         logging.info(f"{coin} - Price: {price:.6f} | Strategy: {active_strategy} | Signal: {signal}")
         return signal
 
@@ -600,6 +776,7 @@ class SimulationBot:
         self.price_history = {}
         self.trade_count = 0
         self.profitable_trades = 0
+        self.initial_portfolio_value = initial_cash
 
     def update_portfolio_value(self, prices):
         portfolio_value = self.cash
@@ -609,18 +786,19 @@ class SimulationBot:
         self.risk_manager.update_portfolio(portfolio_value)
         return portfolio_value
 
-    def calculate_trade_amount(self, price, portfolio_value, active_positions):
-        max_positions = MAX_COINS
-        position_adjustment = min(1.0, max_positions / (active_positions + 1))
-        risk_amount = portfolio_value * POSITION_SIZE_PCT * position_adjustment
+    def calculate_trade_amount(self, price, portfolio_value, score, total_score, current_position_value):
+        score_weight = score / total_score if total_score > 0 else 1.0
+        risk_amount = portfolio_value * POSITION_SIZE_PCT * score_weight
+        available_risk = max(0, portfolio_value * MAX_PORTFOLIO_RISK - current_position_value)
+        risk_amount = min(risk_amount, available_risk)
         trade_qty = risk_amount / price
         trade_qty = math.floor(trade_qty * 10000) / 10000
         return max(0.001, trade_qty)
 
-    def simulate_trade(self, coin, pair, signal, price):
-        active_positions = sum(1 for amount in self.holdings.values() if amount > 0)
-        portfolio_value = self.update_portfolio_value({coin: price})
-        trade_amount = self.calculate_trade_amount(price, portfolio_value, active_positions)
+    def simulate_trade(self, coin, pair, signal, price, score, total_score, prices):
+        portfolio_value = self.update_portfolio_value(prices)
+        current_position_value = sum(amount * prices.get(c, 0) for c, amount in self.holdings.items() if amount > 0)
+        trade_amount = self.calculate_trade_amount(price, portfolio_value, score, total_score, current_position_value)
 
         if coin not in self.holdings:
             self.holdings[coin] = 0
@@ -629,32 +807,40 @@ class SimulationBot:
         if coin not in self.price_history:
             self.price_history[coin] = []
 
+        timestamp = datetime.now()
         self.price_history[coin].append(price)
+        # Save price to file
+        append_price_history(coin, timestamp, price)
 
-        if signal == "BUY" and self.cash >= trade_amount * price * (1 + BUYING_COMMISSION) and active_positions < MAX_COINS:
-            self.holdings[coin] += trade_amount
-            purchase_amount = trade_amount * price
-            commission = purchase_amount * BUYING_COMMISSION
-            total_cost = purchase_amount + commission
-            self.cash -= total_cost
-            self.entry_prices[coin].append(price)
-            trade = {
-                "timestamp": datetime.now(),
-                "action": "BUY",
-                "coin": coin,
-                "pair": pair,
-                "price": price,
-                "amount": trade_amount,
-                "cash_spent": purchase_amount,
-                "commission": commission,
-                "total_cost": total_cost,
-                "cash_balance": self.cash
-            }
-            self.trade_log.append(trade)
-            self.coin_selector.update_trade_history(coin, trade)
-            logging.info(f"BUY: {trade_amount} {coin} at {price}, Spent: {purchase_amount:.6f}, Commission: {commission:.6f}, Total: {total_cost:.6f}, Active Positions: {active_positions + 1}")
-            self.api_client.place_order(coin, "BUY", trade_amount)
-            logging.info(f"Portfolio Value after BUY: {portfolio_value:.2f}")
+        if signal == "BUY" and self.cash >= trade_amount * price * (1 + BUYING_COMMISSION):
+            new_position_value = trade_amount * price
+            if current_position_value + new_position_value <= portfolio_value * MAX_PORTFOLIO_RISK:
+                self.holdings[coin] += trade_amount
+                purchase_amount = trade_amount * price
+                commission = purchase_amount * BUYING_COMMISSION
+                total_cost = purchase_amount + commission
+                self.cash -= total_cost
+                self.entry_prices[coin].append(price)
+                trade = {
+                    "timestamp": datetime.now(),
+                    "action": "BUY",
+                    "coin": coin,
+                    "pair": pair,
+                    "price": price,
+                    "amount": trade_amount,
+                    "cash_spent": purchase_amount,
+                    "commission": commission,
+                    "total_cost": total_cost,
+                    "cash_balance": self.cash
+                }
+                self.trade_log.append(trade)
+                self.coin_selector.update_trade_history(coin, trade)
+                logging.info(f"BUY: {trade_amount} {coin} at {price}, Spent: {purchase_amount:.6f}, Commission: {commission:.6f}, Total: {total_cost:.6f}")
+                self.api_client.place_order(coin, "BUY", trade_amount)
+                logging.info(f"Portfolio Value after BUY: {portfolio_value:.2f}")
+                save_trade_log_to_file(self.trade_log, self.initial_portfolio_value, None, None)
+            else:
+                logging.info(f"{coin} - BUY signal ignored - exceeds portfolio risk limit")
         elif signal == "SELL" and self.holdings.get(coin, 0) >= trade_amount:
             sale_amount = self.holdings[coin] * price
             commission = sale_amount * SELLING_COMMISSION
@@ -683,7 +869,6 @@ class SimulationBot:
                 }
                 if profit > 0:
                     self.profitable_trades += 1
-                # Update strategy performance with profit
                 state = self.strategy.get_strategy_state(coin)
                 self.strategy.update_strategy_performance(coin, state["active_strategy"], "SELL", profit_pct)
                 logging.info(f"{coin} - Trade P&L: {profit:.6f} ({profit_pct:.2f}%)")
@@ -702,12 +887,10 @@ class SimulationBot:
                 }
             self.trade_log.append(trade)
             self.coin_selector.update_trade_history(coin, trade)
-            logging.info(f"SELL: {trade_amount} {coin} at {price}, Received: {sale_amount:.6f}, Commission: {commission:.6f}, Net: {net_proceeds:.6f}, Active Positions: {active_positions - 1}")
+            logging.info(f"SELL: {trade_amount} {coin} at {price}, Received: {sale_amount:.6f}, Commission: {commission:.6f}, Net: {net_proceeds:.6f}")
             self.api_client.place_order(coin, "SELL", trade_amount)
             logging.info(f"Portfolio Value after SELL: {portfolio_value:.2f}")
-            save_trade_log_to_file(self.trade_log)
-        elif signal == "BUY" and active_positions >= MAX_COINS:
-            logging.info(f"{coin} - BUY signal ignored - maximum positions ({MAX_COINS}) reached")
+            save_trade_log_to_file(self.trade_log, self.initial_portfolio_value, None, None)
 
     def run_simulation(self):
         logging.info("Starting multi-coin simulation (runs until manually stopped)...")
@@ -718,24 +901,28 @@ class SimulationBot:
             while True:
                 try:
                     selected_coins = self.coin_selector.select_coins()
-                    logging.info(f"Processing {len(selected_coins)} coins: {[c for c, _ in selected_coins]}")
+                    logging.info(f"Processing {len(selected_coins)} coins: {[c for c, p in selected_coins]}")
 
                     prices = {}
+                    scores = {}
                     for coin, pair in selected_coins:
                         try:
                             ticker_data = self.api_client.get_ticker(pair=pair)
                             if ticker_data and ticker_data.get("Success"):
                                 price = float(ticker_data["Data"][pair]["LastPrice"])
                                 prices[coin] = price
+                                score = self.coin_selector.calculate_coin_score(coin, pair)
+                                scores[coin] = score
                                 current_time = datetime.now()
 
-                                logging.info(f"Time: {current_time} | Coin: {coin} | Price: {price}")
+                                logging.info(f"Time: {current_time} | Coin: {coin} | Price: {price} | Score: {score:.2f}")
                                 self.strategy.update_price_mean(coin, price)
                                 signal = self.strategy.generate_signal(coin, price)
                                 logging.info(f"{coin} - Signal: {signal}")
 
                                 if signal in ["BUY", "SELL"]:
-                                    self.simulate_trade(coin, pair, signal, price)
+                                    total_score = sum(scores.values())
+                                    self.simulate_trade(coin, pair, signal, price, score, total_score, prices)
 
                         except Exception as e:
                             logging.error(f"Error processing {coin}: {e}")
@@ -795,20 +982,24 @@ class SimulationBot:
             final_portfolio_value = self.update_portfolio_value(final_prices)
             sharpe_ratio = self.risk_manager.calculate_sharpe_ratio()
             logging.info(f"Simulation Terminated. Final Portfolio Value: {final_portfolio_value:.2f}")
-            # logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
             logging.info(f"Win Rate: {self.profitable_trades/self.trade_count*100:.2f}% ({self.profitable_trades}/{self.trade_count})" if self.trade_count > 0 else "No trades executed")
-            save_trade_log_to_file(self.trade_log)
+            save_trade_log_to_file(self.trade_log, initial_portfolio_value, final_portfolio_value, sharpe_ratio)
             return final_portfolio_value, sharpe_ratio, self.trade_log
 
 # --- UTILITY FUNCTIONS ---
-def save_trade_log_to_file(trade_log):
+def save_trade_log_to_file(trade_log, initial_portfolio_value, final_portfolio_value, sharpe_ratio):
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"trade_log_{timestamp}.txt"
         with open(filename, "w") as file:
             file.write(f"Trade Log - Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             file.write("=" * 80 + "\n\n")
-            file.write(f"Total Trades: {len(trade_log)}\n\n")
+            file.write(f"Initial Portfolio Value: {initial_portfolio_value:.2f}\n")
+            file.write(f"Final Portfolio Value: {final_portfolio_value if final_portfolio_value is not None else 'N/A'}\n")
+            file.write(f"Sharpe Ratio: {sharpe_ratio:.4f if sharpe_ratio is not None else 'N/A'}\n")
+            file.write(f"Total Trades: {len(trade_log)}\n")
+            file.write(f"Coin-specific trade histories are saved in: {DATA_DIR}/trade_history_<coin>.json\n")
+            file.write(f"Coin-specific price histories are saved in: {DATA_DIR}/price_history_<coin>.csv\n\n")
             file.write("DETAILED TRADE LOG:\n")
             file.write("-" * 80 + "\n")
             for i, trade in enumerate(trade_log, 1):
@@ -853,7 +1044,6 @@ def main():
         logging.info("Simulation Summary:")
         logging.info(f"Final Portfolio Value: {final_value:.2f}")
         logging.info(f"Sharpe Ratio: {sharpe_ratio:.4f}")
-        save_trade_log_to_file(trade_log)
     except Exception as e:
         logging.error(f"Critical error in main function: {e}")
 
